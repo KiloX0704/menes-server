@@ -2,6 +2,8 @@ stages:
   - deploy-test
 deploy-test:
     stage: deploy-test
+    tags:
+      - menes
     script:
       - export VERSION="${CI_COMMIT_REF_NAME}"
       - export NAMESPACE=menes-server
