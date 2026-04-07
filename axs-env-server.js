@@ -236,8 +236,8 @@ async function handleRequest(req, res) {
     console.log(`[${method}] ${pathname}`);
 
     try {
-        // ========== GET /api/health ==========
-        if (method === 'GET' && pathname === '/api/health') {
+        // ========== GET /api/menes/health ==========
+        if (method === 'GET' && pathname === '/api/menes/health') {
             return sendJson(res, 200, {
                 status: 'OK',
                 timestamp: new Date().toISOString(),
@@ -247,8 +247,8 @@ async function handleRequest(req, res) {
             });
         }
 
-        // ========== POST /api/ensure ==========
-        if (method === 'POST' && pathname === '/api/ensure') {
+        // ========== POST /api/menes/ensure ==========
+        if (method === 'POST' && pathname === '/api/menes/ensure') {
             const body = await readBody(req);
 
             const required = ['AXS_TENANT_NAME', 'AXS_USER_ID', 'AXS_API_TOKEN', 'AXS_BASE_URL'];
@@ -275,14 +275,14 @@ async function handleRequest(req, res) {
             return sendJson(res, result.success ? 200 : 400, result);
         }
 
-        // ========== GET /api/workspaces ==========
-        if (method === 'GET' && pathname === '/api/workspaces') {
+        // ========== GET /api/menes/workspaces ==========
+        if (method === 'GET' && pathname === '/api/menes/workspaces') {
             const result = await listWorkspaces();
             return sendJson(res, result.success ? 200 : 500, result);
         }
 
-        // ========== GET /api/env ==========
-        if (method === 'GET' && pathname === '/api/env') {
+        // ========== GET /api/menes/env ==========
+        if (method === 'GET' && pathname === '/api/menes/env') {
             const tenant_name = url.searchParams.get('tenant-name');
             const user_id = url.searchParams.get('user-id');
             const show_sensitive = url.searchParams.get('show_sensitive') === 'true';
@@ -298,8 +298,8 @@ async function handleRequest(req, res) {
             return sendJson(res, result.success ? 200 : 404, result);
         }
 
-        // ========== DELETE /api/workspace ==========
-        if (method === 'DELETE' && pathname === '/api/workspace') {
+        // ========== DELETE /api/menes/workspace ==========
+        if (method === 'DELETE' && pathname === '/api/menes/workspace') {
             const tenant_name = url.searchParams.get('tenant-name');
             const user_id = url.searchParams.get('user-id');
 
@@ -314,8 +314,8 @@ async function handleRequest(req, res) {
             return sendJson(res, result.success ? 200 : 404, result);
         }
 
-        // ========== GET /api/cli/test ========== (测试连接)
-        if (method === 'GET' && pathname === '/api/cli/test') {
+        // ========== GET /api/menes/cli/test ========== (测试连接)
+        if (method === 'GET' && pathname === '/api/menes/cli/test') {
             try {
                 const result = callEnvManager('info', {
                     'tenant-name': 'admin',
@@ -341,12 +341,12 @@ async function handleRequest(req, res) {
             success: false,
             error: `Not found: ${method} ${pathname}`,
             available_endpoints: {
-                'GET /api/health': 'Health check',
-                'GET /api/workspaces': 'List all workspaces',
-                'GET /api/env?tenant-name=<name>&user-id=<id>': 'Get environment variables',
-                'POST /api/ensure': 'Create/update workspace',
-                'DELETE /api/workspace?tenant-name=<name>&user-id=<id>': 'Delete workspace',
-                'GET /api/cli/test': 'Test CLI connection'
+                'GET /api/menes/health': 'Health check',
+                'GET /api/menes/workspaces': 'List all workspaces',
+                'GET /api/menes/env?tenant-name=<name>&user-id=<id>': 'Get environment variables',
+                'POST /api/menes/ensure': 'Create/update workspace',
+                'DELETE /api/menes/workspace?tenant-name=<name>&user-id=<id>': 'Delete workspace',
+                'GET /api/menes/cli/test': 'Test CLI connection'
             }
         });
 
@@ -375,12 +375,12 @@ Usage:
   node axs-env-api-server.js status       # Check status
 
 API Endpoints:
-  GET  /api/health                 - Health check
-  GET  /api/workspaces             - List all workspaces
-  GET  /api/env?tenant-name=<n>&user-id=<i> - Get env vars (filters sensitive)
-  POST /api/ensure                 - Create/update workspace
-  DELETE /api/workspace?tenant-name=<n>&user-id=<i> - Delete workspace
-  GET  /api/cli/test               - Test CLI connection
+  GET  /api/menes/health                 - Health check
+  GET  /api/menes/workspaces             - List all workspaces
+  GET  /api/menes/env?tenant-name=<n>&user-id=<i> - Get env vars (filters sensitive)
+  POST /api/menes/ensure                 - Create/update workspace
+  DELETE /api/menes/workspace?tenant-name=<n>&user-id=<i> - Delete workspace
+  GET  /api/menes/cli/test               - Test CLI connection
 
 Security:
   - AXS_API_TOKEN、APIFOX_API_TOKEN 等敏感变量会被自动隐藏
@@ -392,11 +392,11 @@ Integration:
   - Auto-filters sensitive information
 
 Examples:
-  curl http://localhost:18999/api/health
+  curl http://localhost:18999/api/menes/health
 
-  curl "http://localhost:18999/api/env?tenant-name=admin&user-id=test040701"
+  curl "http://localhost:18999/api/menes/env?tenant-name=admin&user-id=test040701"
 
-  curl -X POST http://localhost:18999/api/ensure \\
+  curl -X POST http://localhost:18999/api/menes/ensure \\
     -H "Content-Type: application/json" \\
     -d '{"AXS_TENANT_NAME": "admin", "AXS_USER_ID": "test040701"}'
 `);
@@ -487,11 +487,11 @@ async function main() {
         console.log(`   Base: ${OPENCLAW_BASE}`);
         console.log(`   CLI: ${ENV_MANAGER_PYTHON}`);
         console.log(`\nAvailable endpoints:`);
-        console.log(`   GET  /api/health`);
-        console.log(`   GET  /api/workspaces`);
-        console.log(`   GET  /api/env?tenant-name=<name>&user-id=<id>`);
-        console.log(`   POST /api/ensure`);
-        console.log(`   DELETE /api/workspace?tenant-name=<name>&user-id=<id>\n`);
+        console.log(`   GET  /api/menes/health`);
+        console.log(`   GET  /api/menes/workspaces`);
+        console.log(`   GET  /api/menes/env?tenant-name=<name>&user-id=<id>`);
+        console.log(`   POST /api/menes/ensure`);
+        console.log(`   DELETE /api/menes/workspace?tenant-name=<name>&user-id=<id>\n`);
     });
 
     // Graceful shutdown
