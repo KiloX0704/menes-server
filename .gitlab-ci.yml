@@ -8,5 +8,6 @@ deploy-test:
       - docker login harbor-kilox.tencentcloudcr.com --username 100025963391 --password eyJhbGciOiJSUzI1NiIsImtpZCI6IjNDWEw6TVRUWDpZVU1WOjZKNE06M1pRNDpGV05MOjNHWUg6QkpOUDpLWVdMOjVHNFc6TEtLRzpKMkhBIn0.eyJvd25lclVpbiI6IjEwMDAyNTk2MzM5MSIsIm9wZXJhdG9yVWluIjoiMTAwMDI1OTYzMzkxIiwidG9rZW5JZCI6ImNkdmgxdGRlN2NkNzVudGsyNGowIiwiZXhwIjoxOTg0NjMxNzk3LCJuYmYiOjE2NjkyNzE3OTcsImlhdCI6MTY2OTI3MTc5N30.N2VVvxk45Xlbr4u43rJKcBkq0d0aikRBamZChUd4VbGza2drIsa0hiYzgDE2a6_SpVN6VkvdaXXjmlApIpVK6xmR-JVs7ehlzhLS18hqoluH7lMDNDplp7_SROpLjOhFyRvb8yaqS5kzzymeq1GGFWhVNE7RXSDajTb5SLKec-QWGFxb0-RSvMo-7e_GXNWS-ODqcblfV4_LeDt_-NoNdCA98EfKRJMQ6RRyS9gQoq-mmh2YVdSb_mNxKe2akqOo7jeIm89keFKXdniib1-kFS2uL51kYWIK2bbY-13mXInX2xYrs-QfbOvJxP-QZtu3QHwby7gM_Eo-hSht2sUVHw
       - docker build -t harbor-kilox.tencentcloudcr.com/menes/menes-server:$VERSION .
       - docker push harbor-kilox.tencentcloudcr.com/menes/menes-server:$VERSION
+      - ssh root@106.55.180.157 "/bin/bash /root/menes-server-deploy.sh $VERSION"
     only:
         - develop
