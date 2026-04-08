@@ -18,9 +18,14 @@ const { execSync, spawn } = require('child_process');
 const DEFAULT_PORT = parseInt(process.env.PORT) || 18999;
 const OPENCLAW_BASE = process.env.OPENCLAW_BASE || '/root/.openclaw';
 
-// ENV_MANAGER 路径
-const ENV_MANAGER_PYTHON = path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py');
-const ENV_MANAGER_NODE = path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'index.js');
+// ENV_MANAGER：默认同 OpenClaw 目录布局；跨容器时请挂卷或显式指定绝对路径
+const ENV_MANAGER_PYTHON =
+    process.env.AXS_ENV_MANAGER_PYTHON ||
+    path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py');
+const ENV_MANAGER_NODE =
+    process.env.AXS_ENV_MANAGER_NODE ||
+    path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'index.js');
+const PYTHON_CMD = process.env.AXS_PYTHON || 'python3';
 
 // 敏感变量列表 - 默认隐藏
 const SENSITIVE_VARS = [
@@ -34,7 +39,7 @@ const SENSITIVE_VARS = [
  */
 function callEnvManager(command, args = {}, extraArgs = []) {
     try {
-        let cmd = `python3 "${ENV_MANAGER_PYTHON}" ${command}`;
+        let cmd = `${PYTHON_CMD} "${ENV_MANAGER_PYTHON}" ${command}`;
 
         // 构建参数
         const params = [];
@@ -229,7 +234,7 @@ function handleCors(req, res) {
 async function handleRequest(req, res) {
     if (handleCors(req, res)) return;
 
-    const url = new URL(req.url, `http://localhost:${process.env.PORT || DEFAULT_PORT}`);
+    const url = new URL(req.url, `http://menes-server:${process.env.PORT || DEFAULT_PORT}`);
     const pathname = url.pathname;
     const method = req.method;
 
@@ -392,11 +397,11 @@ Integration:
   - Auto-filters sensitive information
 
 Examples:
-  curl http://localhost:18999/api/menes/health
+  curl http://menes-server:18999/api/menes/health
 
-  curl "http://localhost:18999/api/menes/env?tenant-name=admin&user-id=test040701"
+  curl "http://menes-server:18999/api/menes/env?tenant-name=admin&user-id=test040701"
 
-  curl -X POST http://localhost:18999/api/menes/ensure \\
+  curl -X POST http://menes-server:18999/api/menes/ensure \\
     -H "Content-Type: application/json" \\
     -d '{"AXS_TENANT_NAME": "admin", "AXS_USER_ID": "test040701"}'
 `);
@@ -416,7 +421,7 @@ async function main() {
 
     if (args[0] === 'start') {
         // 后台启动
-        const server = spawn('node', [path.join(__dirname, 'axs-env-api-server.js')], {
+        const server = spawn('node', [path.join(__dirname, 'axs-env-server.js')], {
             detached: true,
             stdio: 'ignore'
         });
@@ -429,7 +434,7 @@ async function main() {
         // 停止服务
         const pids = [];
         try {
-            const psOutput = execSync('pgrep -f "axs-env-api-server.js"').toString();
+            const psOutput = execSync('pgrep -f "axs-env-server.js"').toString();
             psOutput.split('\n').forEach(line => {
                 if (line.trim()) pids.push(parseInt(line));
             });
@@ -451,7 +456,7 @@ async function main() {
     if (args[0] === 'status') {
         // 查看状态
         try {
-            const psOutput = execSync('pgrep -f "axs-env-api-server.js"').toString();
+            const psOutput = execSync('pgrep -f "axs-env-server.js"').toString();
             if (psOutput.trim()) {
                 console.log(`[Server] Running on port ${process.env.PORT || DEFAULT_PORT}`);
                 console.log('PIDs:', psOutput.trim().split('\n'));
@@ -472,7 +477,7 @@ async function main() {
 
     // 验证 CLI 是否可用
     try {
-        const result = execSync(`python3 "${ENV_MANAGER_PYTHON}" --help`, { encoding: 'utf8' });
+        const result = execSync(`${PYTHON_CMD} "${ENV_MANAGER_PYTHON}" --help`, { encoding: 'utf8' });
         console.log('[Server] CLI verified successfully');
     } catch (error) {
         console.warn('[Server Warning] CLI might not be available:', error.message);
@@ -485,7 +490,7 @@ async function main() {
         console.log(`\n🚀 AXS Environment API Server`);
         console.log(`   Port: ${port}`);
         console.log(`   Base: ${OPENCLAW_BASE}`);
-        console.log(`   CLI: ${ENV_MANAGER_PYTHON}`);
+        console.log(`   CLI: ${ENV_MANAGER_PYTHON} (${fs.existsSync(ENV_MANAGER_PYTHON) ? 'ok' : 'MISSING — set AXS_ENV_MANAGER_PYTHON or mount OPENCLAW_BASE'})`);
         console.log(`\nAvailable endpoints:`);
         console.log(`   GET  /api/menes/health`);
         console.log(`   GET  /api/menes/workspaces`);
