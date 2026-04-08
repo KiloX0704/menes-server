@@ -17,15 +17,55 @@ const { execSync, spawn } = require('child_process');
 // 配置
 const DEFAULT_PORT = parseInt(process.env.PORT) || 18999;
 const OPENCLAW_BASE = process.env.OPENCLAW_BASE || '/root/.openclaw';
-
-// ENV_MANAGER：默认同 OpenClaw 目录布局；跨容器时请挂卷或显式指定绝对路径
-const ENV_MANAGER_PYTHON =
-    process.env.AXS_ENV_MANAGER_PYTHON ||
-    path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py');
-const ENV_MANAGER_NODE =
-    process.env.AXS_ENV_MANAGER_NODE ||
-    path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'index.js');
 const PYTHON_CMD = process.env.AXS_PYTHON || 'python3';
+
+/**
+ * 在「当前进程所在容器」内解析 axs_env_manager.py。
+ * 默认先找 OPENCLAW_BASE（与 OpenClaw 同盘挂载），再找与 axs-env-server.js 同级的 skills/（镜像内 COPY）。
+ */
+function resolveEnvManagerPython() {
+    if (process.env.AXS_ENV_MANAGER_PYTHON) {
+        return process.env.AXS_ENV_MANAGER_PYTHON;
+    }
+    const candidates = [
+        path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py'),
+        path.join(__dirname, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py'),
+        path.join(process.cwd(), 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py')
+    ];
+    for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+    }
+    // 未找到时返回「服务目录下 skills」路径，便于报错提示与 Dockerfile 约定一致
+    return candidates[1];
+}
+
+function resolveEnvManagerNode() {
+    if (process.env.AXS_ENV_MANAGER_NODE) {
+        return process.env.AXS_ENV_MANAGER_NODE;
+    }
+    const candidates = [
+        path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'index.js'),
+        path.join(__dirname, 'skills', 'axs-env-manager', 'index.js'),
+        path.join(process.cwd(), 'skills', 'axs-env-manager', 'index.js')
+    ];
+    for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+    }
+    return candidates[1];
+}
+
+const ENV_MANAGER_PYTHON = resolveEnvManagerPython();
+const ENV_MANAGER_NODE = resolveEnvManagerNode();
+
+function envManagerScriptMissingMessage() {
+    return (
+        `axs_env_manager.py not found at "${ENV_MANAGER_PYTHON}". ` +
+        `The menes-server request runs inside the menes-server container — a path that exists in the OpenClaw container is not visible here unless you mount the same volume or COPY the skill into this image. ` +
+        `Fix: set AXS_ENV_MANAGER_PYTHON to the script path inside this container, ` +
+        `or place files at ${path.join(__dirname, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py')}, ` +
+        `or mount OpenClaw data and set OPENCLAW_BASE.`
+    );
+}
 
 // 敏感变量列表 - 默认隐藏
 const SENSITIVE_VARS = [
@@ -39,6 +79,9 @@ const SENSITIVE_VARS = [
  */
 function callEnvManager(command, args = {}, extraArgs = []) {
     try {
+        if (!fs.existsSync(ENV_MANAGER_PYTHON)) {
+            throw new Error(envManagerScriptMissingMessage());
+        }
         let cmd = `${PYTHON_CMD} "${ENV_MANAGER_PYTHON}" ${command}`;
 
         // 构建参数
@@ -490,7 +533,10 @@ async function main() {
         console.log(`\n🚀 AXS Environment API Server`);
         console.log(`   Port: ${port}`);
         console.log(`   Base: ${OPENCLAW_BASE}`);
-        console.log(`   CLI: ${ENV_MANAGER_PYTHON} (${fs.existsSync(ENV_MANAGER_PYTHON) ? 'ok' : 'MISSING — set AXS_ENV_MANAGER_PYTHON or mount OPENCLAW_BASE'})`);
+        console.log(`   CLI: ${ENV_MANAGER_PYTHON} (${fs.existsSync(ENV_MANAGER_PYTHON) ? 'ok' : 'MISSING'})`);
+        if (!fs.existsSync(ENV_MANAGER_PYTHON)) {
+            console.warn('[Server]', envManagerScriptMissingMessage());
+        }
         console.log(`\nAvailable endpoints:`);
         console.log(`   GET  /api/menes/health`);
         console.log(`   GET  /api/menes/workspaces`);
