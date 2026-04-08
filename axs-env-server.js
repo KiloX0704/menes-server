@@ -111,7 +111,7 @@ async function ensureWorkspace(params) {
         const { tenant_name, user_id, token, base_url, tenant, tenant_uuid, station_id, version } = params;
 
         // 调用 Python CLI 确保 workspace 存在
-        callEnvManager('ensure', {
+        await callEnvManager('ensure', {
             'tenant-name': tenant_name,
             'user-id': user_id,
             token: token,
@@ -129,13 +129,62 @@ async function ensureWorkspace(params) {
     }
 }
 
+function workspacePathFor(tenant_name, user_id) {
+    return path.join(OPENCLAW_BASE, `workspace_${tenant_name}_${user_id}`);
+}
+
+function envFilePathFor(tenant_name, user_id) {
+    return path.join(workspacePathFor(tenant_name, user_id), '.env.axs');
+}
+
+function escapeEnvValue(value) {
+    return String(value ?? '')
+        .replaceAll('\\', '\\\\')
+        .replaceAll('"', '\\"')
+        .replaceAll('\r', '\\r')
+        .replaceAll('\n', '\\n');
+}
+
+function upsertEnvFileExports(filePath, exportsMap) {
+    const normalized = {};
+    for (const [k, v] of Object.entries(exportsMap || {})) {
+        if (v === undefined || v === null) continue;
+        normalized[k] = escapeEnvValue(v);
+    }
+    if (Object.keys(normalized).length === 0) return;
+
+    let existing = '';
+    if (fs.existsSync(filePath)) {
+        existing = fs.readFileSync(filePath, 'utf8');
+    } else {
+        const dir = path.dirname(filePath);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const lines = existing ? existing.split('\n') : [];
+    const idxByKey = new Map();
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^export\s+([A-Z0-9_]+)="([\s\S]*)"$/);
+        if (m) idxByKey.set(m[1], i);
+    }
+
+    for (const [k, v] of Object.entries(normalized)) {
+        const newLine = `export ${k}="${v}"`;
+        const idx = idxByKey.get(k);
+        if (idx === undefined) lines.push(newLine);
+        else lines[idx] = newLine;
+    }
+
+    fs.writeFileSync(filePath, lines.join('\n').trimEnd() + '\n', 'utf8');
+}
+
 /**
  * 获取环境变量
  */
 async function getEnvVars(tenant_name, user_id, show_sensitive = false) {
     try {
         // 先通过 Python CLI 检查 workspace 是否存在
-        const result = callEnvManager('info', {
+        const result = await callEnvManager('info', {
             'tenant-name': tenant_name,
             'user-id': user_id
         });
@@ -144,12 +193,12 @@ async function getEnvVars(tenant_name, user_id, show_sensitive = false) {
             return {
                 success: false,
                 error: 'Workspace not found',
-                workspace_path: `/root/.openclaw/workspace_${tenant_name}_${user_id}`
+                workspace_path: workspacePathFor(tenant_name, user_id)
             };
         }
 
         // 读取 .env.axs 文件
-        const envFilePath = path.join(OPENCLAW_BASE, `workspace_${tenant_name}_${user_id}`, '.env.axs');
+        const envFilePath = envFilePathFor(tenant_name, user_id);
 
         if (!fs.existsSync(envFilePath)) {
             return {
@@ -214,7 +263,7 @@ async function listWorkspaces() {
  */
 async function deleteWorkspace(tenant_name, user_id) {
     try {
-        const workspacePath = path.join(OPENCLAW_BASE, `workspace_${tenant_name}_${user_id}`);
+        const workspacePath = workspacePathFor(tenant_name, user_id);
 
         if (fs.existsSync(workspacePath)) {
             fs.rmSync(workspacePath, { recursive: true, force: true });
@@ -299,7 +348,8 @@ async function handleRequest(req, res) {
         if (method === 'POST' && pathname === '/api/menes/ensure') {
             const body = await readBody(req);
 
-            const required = ['AXS_TENANT_NAME', 'AXS_USER_ID', 'AXS_API_TOKEN', 'AXS_BASE_URL'];
+            // 必填：tenant/user/token。其余字段若未传入则补默认值。
+            const required = ['AXS_TENANT_NAME', 'AXS_USER_ID', 'AXS_API_TOKEN'];
             for (const field of required) {
                 if (!body[field]) {
                     return sendJson(res, 400, {
@@ -309,6 +359,22 @@ async function handleRequest(req, res) {
                 }
             }
 
+            const defaults = {
+                AXS_STATION_ID: '800019',
+                AXS_BASE_URL: 'https://admin.pre.linkedsight.com',
+                AXS_VERSION: '5.4',
+                APIFOX_API_TOKEN: 'y7pNL3qKOlD5Uy2QEEC2MyPx9qZIejoh',
+                APIFOX_RIDS_PROJECT_ID: '1487279',
+                APIFOX_OTHER_PROJECT_ID: '1487426',
+                AXS_CACHE_DIR: '/root/.openclaw/cache/axs-api-doc',
+                AXS_CACHE_TTL: '300',
+                AXS_DEBUG: 'false'
+            };
+
+            for (const [k, v] of Object.entries(defaults)) {
+                if (body[k] === undefined || body[k] === null || body[k] === '') body[k] = v;
+            }
+
             const result = await ensureWorkspace({
                 tenant_name: body.AXS_TENANT_NAME,
                 user_id: body.AXS_USER_ID,
@@ -316,9 +382,31 @@ async function handleRequest(req, res) {
                 base_url: body.AXS_BASE_URL,
                 tenant: body.AXS_TENANT || '',
                 tenant_uuid: body.AXS_TENANT_UUID || '',
-                station_id: body.AXS_STATION_ID || '122',
-                version: body.AXS_VERSION || '5.4'
+                station_id: body.AXS_STATION_ID,
+                version: body.AXS_VERSION
             });
+
+            if (result.success) {
+                const envPath = envFilePathFor(body.AXS_TENANT_NAME, body.AXS_USER_ID);
+                try {
+                    upsertEnvFileExports(envPath, {
+                        AXS_STATION_ID: body.AXS_STATION_ID,
+                        AXS_BASE_URL: body.AXS_BASE_URL,
+                        AXS_VERSION: body.AXS_VERSION,
+                        APIFOX_API_TOKEN: body.APIFOX_API_TOKEN,
+                        APIFOX_RIDS_PROJECT_ID: body.APIFOX_RIDS_PROJECT_ID,
+                        APIFOX_OTHER_PROJECT_ID: body.APIFOX_OTHER_PROJECT_ID,
+                        AXS_CACHE_DIR: body.AXS_CACHE_DIR,
+                        AXS_CACHE_TTL: body.AXS_CACHE_TTL,
+                        AXS_DEBUG: body.AXS_DEBUG
+                    });
+                    result.env_written = true;
+                    result.env_path = envPath;
+                } catch (e) {
+                    result.env_written = false;
+                    result.env_write_error = e?.message || String(e);
+                }
+            }
 
             return sendJson(res, result.success ? 200 : 400, result);
         }
@@ -365,9 +453,9 @@ async function handleRequest(req, res) {
         // ========== GET /api/menes/cli/test ========== (测试连接)
         if (method === 'GET' && pathname === '/api/menes/cli/test') {
             try {
-                const result = callEnvManager('info', {
+                const result = await callEnvManager('info', {
                     'tenant-name': 'admin',
-                    'user-id': 'test040701'
+                    'user-id': 'test040801'
                 });
 
                 return sendJson(res, 200, {
