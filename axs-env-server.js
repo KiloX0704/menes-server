@@ -363,7 +363,7 @@ async function handleRequest(req, res) {
                 AXS_STATION_ID: '800019',
                 AXS_BASE_URL: 'https://admin.pre.linkedsight.com',
                 AXS_VERSION: '5.4',
-                AXS_SORT_SERVICE_URL: 'http://113.118.44.131:5555/sort_tasks',
+                AXS_SORT_SERVICE_URL: 'http://101.33.204.121:5555/sort_tasks',
                 APIFOX_API_TOKEN: 'y7pNL3qKOlD5Uy2QEEC2MyPx9qZIejoh',
                 APIFOX_RIDS_PROJECT_ID: '1487279',
                 APIFOX_OTHER_PROJECT_ID: '1487426',
