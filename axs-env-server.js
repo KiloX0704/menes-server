@@ -368,6 +368,8 @@ async function handleRequest(req, res) {
                 APIFOX_API_TOKEN: 'afxp_39b4fceBMSyoFjsf2AxFV4WpJeP5uEVQgb7s',
                 APIFOX_RIDS_PROJECT_ID: '1487279',
                 APIFOX_OTHER_PROJECT_ID: '1487426',
+                APIFOX_RIDS_BRANCH_ID: "2427677",
+                APIFOX_OTHER_BRANCH_ID: "2427814",
                 AXS_CACHE_DIR: '/root/.openclaw/cache/axs-api-doc',
                 AXS_CACHE_TTL: '300',
                 AXS_DEBUG: 'false'
@@ -400,6 +402,8 @@ async function handleRequest(req, res) {
                         APIFOX_API_TOKEN: body.APIFOX_API_TOKEN,
                         APIFOX_RIDS_PROJECT_ID: body.APIFOX_RIDS_PROJECT_ID,
                         APIFOX_OTHER_PROJECT_ID: body.APIFOX_OTHER_PROJECT_ID,
+                        APIFOX_RIDS_BRANCH_ID: body.APIFOX_RIDS_BRANCH_ID,
+                        APIFOX_OTHER_BRANCH_ID: body.APIFOX_OTHER_BRANCH_ID,
                         AXS_CACHE_DIR: body.AXS_CACHE_DIR,
                         AXS_CACHE_TTL: body.AXS_CACHE_TTL,
                         AXS_DEBUG: body.AXS_DEBUG
