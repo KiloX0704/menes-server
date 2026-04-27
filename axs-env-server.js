@@ -365,7 +365,7 @@ async function handleRequest(req, res) {
                 AXS_VERSION: '5.4',
                 AXS_SORT_SERVICE_URL: 'http://101.33.204.121:5555/sort_tasks',
                 AXS_SUBSPATIAL_CREATE_URL: 'http://113.118.45.10:5555/generate_sub_tasks',
-                APIFOX_API_TOKEN: 'afxp_867030LFoZIJVRLl0GeQMcrblUoE7quIRRsH',
+                APIFOX_API_TOKEN: 'afxp_39b4fceBMSyoFjsf2AxFV4WpJeP5uEVQgb7s',
                 APIFOX_RIDS_PROJECT_ID: '1487279',
                 APIFOX_OTHER_PROJECT_ID: '1487426',
                 AXS_CACHE_DIR: '/root/.openclaw/cache/axs-api-doc',
