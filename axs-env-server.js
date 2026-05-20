@@ -29,7 +29,7 @@ const SENSITIVE_VARS = [
 ];
 
 // 共享文件列表
-const SHARED_FILES = ['SOUL.md', 'IDENTITY.md'];
+const SHARED_FILES = ['AGENTS.md', 'IDENTITY.md', 'SOUL.md'];
 
 // ==================== 工具函数 ====================
 
