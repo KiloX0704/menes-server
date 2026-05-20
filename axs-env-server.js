@@ -17,55 +17,6 @@ const { execSync, spawn } = require('child_process');
 // 配置
 const DEFAULT_PORT = parseInt(process.env.PORT) || 18999;
 const OPENCLAW_BASE = process.env.OPENCLAW_BASE || '/root/.openclaw';
-const PYTHON_CMD = process.env.AXS_PYTHON || 'python3';
-
-/**
- * 在「当前进程所在容器」内解析 axs_env_manager.py。
- * 默认先找 OPENCLAW_BASE（与 OpenClaw 同盘挂载），再找与 axs-env-server.js 同级的 skills/（镜像内 COPY）。
- */
-function resolveEnvManagerPython() {
-    if (process.env.AXS_ENV_MANAGER_PYTHON) {
-        return process.env.AXS_ENV_MANAGER_PYTHON;
-    }
-    const candidates = [
-        path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py'),
-        path.join(__dirname, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py'),
-        path.join(process.cwd(), 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py')
-    ];
-    for (const p of candidates) {
-        if (fs.existsSync(p)) return p;
-    }
-    // 未找到时返回「服务目录下 skills」路径，便于报错提示与 Dockerfile 约定一致
-    return candidates[1];
-}
-
-function resolveEnvManagerNode() {
-    if (process.env.AXS_ENV_MANAGER_NODE) {
-        return process.env.AXS_ENV_MANAGER_NODE;
-    }
-    const candidates = [
-        path.join(OPENCLAW_BASE, 'skills', 'axs-env-manager', 'index.js'),
-        path.join(__dirname, 'skills', 'axs-env-manager', 'index.js'),
-        path.join(process.cwd(), 'skills', 'axs-env-manager', 'index.js')
-    ];
-    for (const p of candidates) {
-        if (fs.existsSync(p)) return p;
-    }
-    return candidates[1];
-}
-
-const ENV_MANAGER_PYTHON = resolveEnvManagerPython();
-const ENV_MANAGER_NODE = resolveEnvManagerNode();
-
-function envManagerScriptMissingMessage() {
-    return (
-        `axs_env_manager.py not found at "${ENV_MANAGER_PYTHON}". ` +
-        `The menes-server request runs inside the menes-server container — a path that exists in the OpenClaw container is not visible here unless you mount the same volume or COPY the skill into this image. ` +
-        `Fix: set AXS_ENV_MANAGER_PYTHON to the script path inside this container, ` +
-        `or place files at ${path.join(__dirname, 'skills', 'axs-env-manager', 'scripts', 'axs_env_manager.py')}, ` +
-        `or mount OpenClaw data and set OPENCLAW_BASE.`
-    );
-}
 
 // 敏感变量列表 - 默认隐藏
 const SENSITIVE_VARS = [
@@ -75,58 +26,60 @@ const SENSITIVE_VARS = [
 ];
 
 /**
- * 调用 axs-env-manager Python CLI
+ * 确保 workspace 目录和 .env.axs 文件存在
+ * 不依赖 Python CLI，直接用 Node.js fs 操作
  */
-function callEnvManager(command, args = {}, extraArgs = []) {
-    try {
-        if (!fs.existsSync(ENV_MANAGER_PYTHON)) {
-            throw new Error(envManagerScriptMissingMessage());
-        }
-        let cmd = `${PYTHON_CMD} "${ENV_MANAGER_PYTHON}" ${command}`;
+function ensureWorkspaceDirect(tenant_name, user_id) {
+  const wsPath = workspacePathFor(tenant_name, user_id);
+  const envPath = envFilePathFor(tenant_name, user_id);
 
-        // 构建参数
-        const params = [];
-        for (const [key, value] of Object.entries(args)) {
-            params.push(`--${key.replace('_', '-')} "${value}"`);
-        }
+  // 创建目录（如果不存在）
+  if (!fs.existsSync(wsPath)) {
+    fs.mkdirSync(wsPath, { recursive: true });
+    console.log(`[ensure] Created workspace: ${wsPath}`);
+  }
 
-        if (extraArgs.length > 0) {
-            params.push(...extraArgs);
-        }
-
-        cmd += ' ' + params.join(' ');
-
-        console.log(`[CLI] Executing: ${cmd}`);
-        return execSync(cmd, { encoding: 'utf8', timeout: 10000 });
-    } catch (error) {
-        throw new Error(error.stderr || error.message || 'CLI execution failed');
-    }
+  return { workspace_path: wsPath, env_path: envPath };
 }
 
 /**
- * 创建/更新 workspace
+ * 在 openclaw.json 中注册 agent（如未注册）
+ * 返回 { registered: true/false, agent_name: string }
  */
-async function ensureWorkspace(params) {
-    try {
-        const { tenant_name, user_id, token, base_url, tenant, tenant_uuid, station_id, version } = params;
+function registerAgentInOpenclaw(tenant_name, user_id) {
+  const configPath = path.join(OPENCLAW_BASE, 'openclaw.json');
+  if (!fs.existsSync(configPath)) {
+    console.log('[register] openclaw.json not found, skipping');
+    return { registered: false, agent_name: null };
+  }
 
-        // 调用 Python CLI 确保 workspace 存在
-        await callEnvManager('ensure', {
-            'tenant-name': tenant_name,
-            'user-id': user_id,
-            token: token,
-            'base-url': base_url,
-            tenant: tenant,
-            'tenant-uuid': tenant_uuid,
-            'station-id': station_id,
-            version: version
-        });
+  const agentName = `${tenant_name}_${user_id}`;
+  const wsPath = workspacePathFor(tenant_name, user_id);
+  const envPath = envFilePathFor(tenant_name, user_id);
 
-        return { success: true };
-    } catch (error) {
-        console.error('[HTTP API] Ensure workspace error:', error.message);
-        return { success: false, error: error.message };
-    }
+  let config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+  // 确保 agents.list 存在
+  if (!config.agents) config.agents = {};
+  if (!config.agents.list) config.agents.list = [];
+
+  // 检查是否已注册
+  const exists = config.agents.list.some(a => a.name === agentName);
+  if (!exists) {
+    config.agents.list.push({
+      name: agentName,
+      workspace: wsPath,
+      env: {
+        AXS_ENV_FILE: envPath
+      }
+    });
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+    console.log(`[register] Registered agent '${agentName}' in openclaw.json`);
+    return { registered: true, agent_name: agentName };
+  }
+
+  console.log(`[register] Agent '${agentName}' already exists`);
+  return { registered: false, agent_name: agentName };
 }
 
 function workspacePathFor(tenant_name, user_id) {
@@ -182,63 +135,45 @@ function upsertEnvFileExports(filePath, exportsMap) {
  * 获取环境变量
  */
 async function getEnvVars(tenant_name, user_id, show_sensitive = false) {
-    try {
-        // 先通过 Python CLI 检查 workspace 是否存在
-        const result = await callEnvManager('info', {
-            'tenant-name': tenant_name,
-            'user-id': user_id
-        });
+  try {
+    const envFilePath = envFilePathFor(tenant_name, user_id);
 
-        if (!result.includes('存在：是')) {
-            return {
-                success: false,
-                error: 'Workspace not found',
-                workspace_path: workspacePathFor(tenant_name, user_id)
-            };
-        }
-
-        // 读取 .env.axs 文件
-        const envFilePath = envFilePathFor(tenant_name, user_id);
-
-        if (!fs.existsSync(envFilePath)) {
-            return {
-                success: false,
-                error: 'Environment file not found'
-            };
-        }
-
-        const content = fs.readFileSync(envFilePath, 'utf8');
-        const lines = content.split('\n');
-        const vars = {};
-
-        for (const line of lines) {
-            const match = line.match(/^export\s+(\w+)="([^"]*)"/);
-            if (match) {
-                vars[match[1]] = match[2];
-            }
-        }
-
-        if (show_sensitive) {
-            return { success: true, envVars: vars, hidden_count: 0 };
-        }
-
-        // 过滤敏感变量
-        const publicVars = {};
-        let hiddenCount = 0;
-
-        for (const [key, value] of Object.entries(vars)) {
-            if (SENSITIVE_VARS.includes(key)) {
-                hiddenCount++;
-            } else {
-                publicVars[key] = value;
-            }
-        }
-
-        return { success: true, envVars: publicVars, hidden_count: hiddenCount };
-    } catch (error) {
-        console.error('[HTTP API] Get env error:', error.message);
-        return { success: false, error: error.message };
+    if (!fs.existsSync(envFilePath)) {
+      return {
+        success: false,
+        error: 'Environment file not found',
+        workspace_path: workspacePathFor(tenant_name, user_id)
+      };
     }
+
+    const content = fs.readFileSync(envFilePath, 'utf8');
+    const lines = content.split('\n');
+    const vars = {};
+
+    for (const line of lines) {
+      const match = line.match(/^export\s+(\w+)="([^"]*)"/);
+      if (match) vars[match[1]] = match[2];
+    }
+
+    if (show_sensitive) {
+      return { success: true, envVars: vars, hidden_count: 0 };
+    }
+
+    const publicVars = {};
+    let hiddenCount = 0;
+    for (const [key, value] of Object.entries(vars)) {
+      if (SENSITIVE_VARS.includes(key)) {
+        hiddenCount++;
+      } else {
+        publicVars[key] = value;
+      }
+    }
+
+    return { success: true, envVars: publicVars, hidden_count: hiddenCount };
+  } catch (error) {
+    console.error('[HTTP API] Get env error:', error.message);
+    return { success: false, error: error.message };
+  }
 }
 
 /**
@@ -346,80 +281,79 @@ async function handleRequest(req, res) {
 
         // ========== POST /api/menes/ensure ==========
         if (method === 'POST' && pathname === '/api/menes/ensure') {
-            const body = await readBody(req);
+        const body = await readBody(req);
 
-            // 必填：tenant/user/token。其余字段若未传入则补默认值。
-            const required = ['AXS_TENANT_NAME', 'AXS_USER_ID', 'AXS_API_TOKEN'];
-            for (const field of required) {
-                if (!body[field]) {
-                    return sendJson(res, 400, {
-                        success: false,
-                        error: `Missing required field: ${field}`
-                    });
-                }
-            }
-
-            const defaults = {
-                AXS_STATION_ID: '800019',
-                AXS_BASE_URL: 'https://admin.pre.linkedsight.com',
-                AXS_VERSION: '5.4',
-                AXS_SORT_SERVICE_URL: 'http://101.33.204.121:5555/sort_tasks',
-                AXS_SUBSPATIAL_CREATE_URL: 'http://113.118.46.251:5555/generate_sub_tasks',
-                AXS_SPATIAL_ROUTE_URL: 'http://113.118.46.251:5555/solve_task_route',
-                APIFOX_API_TOKEN: 'afxp_39b4fceBMSyoFjsf2AxFV4WpJeP5uEVQgb7s',
-                APIFOX_RIDS_PROJECT_ID: '1487279',
-                APIFOX_OTHER_PROJECT_ID: '1487426',
-                APIFOX_RIDS_BRANCH_ID: "2427677",
-                APIFOX_OTHER_BRANCH_ID: "2427814",
-                AXS_CACHE_DIR: '/root/.openclaw/cache/axs-api-doc',
-                AXS_CACHE_TTL: '300',
-                AXS_DEBUG: 'false'
-            };
-
-            for (const [k, v] of Object.entries(defaults)) {
-                if (body[k] === undefined || body[k] === null || body[k] === '') body[k] = v;
-            }
-
-            const result = await ensureWorkspace({
-                tenant_name: body.AXS_TENANT_NAME,
-                user_id: body.AXS_USER_ID,
-                token: body.AXS_API_TOKEN,
-                base_url: body.AXS_BASE_URL,
-                tenant: body.AXS_TENANT || '',
-                tenant_uuid: body.AXS_TENANT_UUID || '',
-                station_id: body.AXS_STATION_ID,
-                version: body.AXS_VERSION
+        // 必填校验
+        const required = ['AXS_TENANT_NAME', 'AXS_USER_ID', 'AXS_API_TOKEN'];
+        for (const field of required) {
+            if (!body[field]) {
+            return sendJson(res, 400, {
+                success: false,
+                error: `Missing required field: ${field}`
             });
-
-            if (result.success) {
-                const envPath = envFilePathFor(body.AXS_TENANT_NAME, body.AXS_USER_ID);
-                try {
-                    upsertEnvFileExports(envPath, {
-                        AXS_STATION_ID: body.AXS_STATION_ID,
-                        AXS_BASE_URL: body.AXS_BASE_URL,
-                        AXS_VERSION: body.AXS_VERSION,
-                        AXS_SORT_SERVICE_URL: body.AXS_SORT_SERVICE_URL,
-                        AXS_SUBSPATIAL_CREATE_URL: body.AXS_SUBSPATIAL_CREATE_URL,
-                        APIFOX_API_TOKEN: body.APIFOX_API_TOKEN,
-                        APIFOX_RIDS_PROJECT_ID: body.APIFOX_RIDS_PROJECT_ID,
-                        APIFOX_OTHER_PROJECT_ID: body.APIFOX_OTHER_PROJECT_ID,
-                        APIFOX_RIDS_BRANCH_ID: body.APIFOX_RIDS_BRANCH_ID,
-                        APIFOX_OTHER_BRANCH_ID: body.APIFOX_OTHER_BRANCH_ID,
-                        AXS_CACHE_DIR: body.AXS_CACHE_DIR,
-                        AXS_CACHE_TTL: body.AXS_CACHE_TTL,
-                        AXS_DEBUG: body.AXS_DEBUG
-                    });
-                    result.env_written = true;
-                    result.env_path = envPath;
-                } catch (e) {
-                    result.env_written = false;
-                    result.env_write_error = e?.message || String(e);
-                }
             }
-
-            return sendJson(res, result.success ? 200 : 400, result);
         }
 
+        // 默认值
+        const defaults = {
+            AXS_STATION_ID: '800019',
+            AXS_BASE_URL: 'https://admin.pre.linkedsight.com',
+            AXS_VERSION: '5.4',
+            AXS_SORT_SERVICE_URL: 'http://101.33.204.121:5555/sort_tasks',
+            AXS_SUBSPATIAL_CREATE_URL: 'http://113.118.46.251:5555/generate_sub_tasks',
+            AXS_SPATIAL_ROUTE_URL: 'http://113.118.46.251:5555/solve_task_route',
+            APIFOX_API_TOKEN: 'afxp_39b4fceBMSyoFjsf2AxFV4WpJeP5uEVQgb7s',
+            APIFOX_RIDS_PROJECT_ID: '1487279',
+            APIFOX_OTHER_PROJECT_ID: '1487426',
+            APIFOX_RIDS_BRANCH_ID: "2427677",
+            APIFOX_OTHER_BRANCH_ID: "2427814",
+            AXS_CACHE_DIR: '/root/.openclaw/cache/axs-api-doc',
+            AXS_CACHE_TTL: '300',
+            AXS_DEBUG: 'false'
+        };
+        for (const [k, v] of Object.entries(defaults)) {
+            if (body[k] === undefined || body[k] === null || body[k] === '') body[k] = v;
+        }
+
+        const { AXS_TENANT_NAME, AXS_USER_ID } = body;
+
+        // Step 1: 确保目录和 .env.axs 文件
+        const { workspace_path, env_path } = ensureWorkspaceDirect(AXS_TENANT_NAME, AXS_USER_ID);
+
+        // Step 2: 写 .env.axs（含 AXS_TENANT_NAME 和 AXS_USER_ID）
+        upsertEnvFileExports(env_path, {
+            AXS_API_TOKEN: body.AXS_API_TOKEN,
+            AXS_BASE_URL: body.AXS_BASE_URL,
+            AXS_TENANT: body.AXS_TENANT || '',
+            AXS_TENANT_UUID: body.AXS_TENANT_UUID || '',
+            AXS_TENANT_NAME: AXS_TENANT_NAME,
+            AXS_USER_ID: AXS_USER_ID,
+            AXS_STATION_ID: body.AXS_STATION_ID,
+            AXS_VERSION: body.AXS_VERSION,
+            AXS_SORT_SERVICE_URL: body.AXS_SORT_SERVICE_URL,
+            AXS_SUBSPATIAL_CREATE_URL: body.AXS_SUBSPATIAL_CREATE_URL,
+            APIFOX_API_TOKEN: body.APIFOX_API_TOKEN,
+            APIFOX_RIDS_PROJECT_ID: body.APIFOX_RIDS_PROJECT_ID,
+            APIFOX_OTHER_PROJECT_ID: body.APIFOX_OTHER_PROJECT_ID,
+            APIFOX_RIDS_BRANCH_ID: body.APIFOX_RIDS_BRANCH_ID,
+            APIFOX_OTHER_BRANCH_ID: body.APIFOX_OTHER_BRANCH_ID,
+            AXS_CACHE_DIR: body.AXS_CACHE_DIR,
+            AXS_CACHE_TTL: body.AXS_CACHE_TTL,
+            AXS_DEBUG: body.AXS_DEBUG
+        });
+
+        // Step 3: 注册到 openclaw.json
+        const reg = registerAgentInOpenclaw(AXS_TENANT_NAME, AXS_USER_ID);
+
+        return sendJson(res, 200, {
+            success: true,
+            workspace_path,
+            env_path,
+            agent_registered: reg.registered,
+            agent_name: reg.agent_name
+        });
+        }
+        
         // ========== GET /api/menes/workspaces ==========
         if (method === 'GET' && pathname === '/api/menes/workspaces') {
             const result = await listWorkspaces();
@@ -459,28 +393,6 @@ async function handleRequest(req, res) {
             return sendJson(res, result.success ? 200 : 404, result);
         }
 
-        // ========== GET /api/menes/cli/test ========== (测试连接)
-        if (method === 'GET' && pathname === '/api/menes/cli/test') {
-            try {
-                const result = await callEnvManager('info', {
-                    'tenant-name': 'admin',
-                    'user-id': 'test040801'
-                });
-
-                return sendJson(res, 200, {
-                    status: 'connected',
-                    python_path: ENV_MANAGER_PYTHON,
-                    node_path: ENV_MANAGER_NODE,
-                    output: result?.substring(0, 200) || 'OK'
-                });
-            } catch (error) {
-                return sendJson(res, 500, {
-                    status: 'disconnected',
-                    error: error.message
-                });
-            }
-        }
-
         // 404 Not Found
         sendJson(res, 404, {
             success: false,
@@ -490,8 +402,7 @@ async function handleRequest(req, res) {
                 'GET /api/menes/workspaces': 'List all workspaces',
                 'GET /api/menes/env?tenant-name=<name>&user-id=<id>': 'Get environment variables',
                 'POST /api/menes/ensure': 'Create/update workspace',
-                'DELETE /api/menes/workspace?tenant-name=<name>&user-id=<id>': 'Delete workspace',
-                'GET /api/menes/cli/test': 'Test CLI connection'
+                'DELETE /api/menes/workspace?tenant-name=<name>&user-id=<id>': 'Delete workspace'
             }
         });
 
@@ -525,14 +436,13 @@ API Endpoints:
   GET  /api/menes/env?tenant-name=<n>&user-id=<i> - Get env vars (filters sensitive)
   POST /api/menes/ensure                 - Create/update workspace
   DELETE /api/menes/workspace?tenant-name=<n>&user-id=<i> - Delete workspace
-  GET  /api/menes/cli/test               - Test CLI connection
 
 Security:
   - AXS_API_TOKEN、APIFOX_API_TOKEN 等敏感变量会被自动隐藏
   - 使用 show_sensitive=true 可查看完整变量
 
 Integration:
-  - Uses axs-env-manager CLI for environment management
+  - Direct file-based workspace management (no Python CLI dependency)
   - Works with multiple tenants/workspaces
   - Auto-filters sensitive information
 
@@ -615,14 +525,6 @@ async function main() {
         ? parseInt(args[portArg + 1])
         : DEFAULT_PORT;
 
-    // 验证 CLI 是否可用
-    try {
-        const result = execSync(`${PYTHON_CMD} "${ENV_MANAGER_PYTHON}" --help`, { encoding: 'utf8' });
-        console.log('[Server] CLI verified successfully');
-    } catch (error) {
-        console.warn('[Server Warning] CLI might not be available:', error.message);
-    }
-
     // 创建 HTTP 服务器
     const server = require('http').createServer(handleRequest);
 
@@ -630,10 +532,6 @@ async function main() {
         console.log(`\n🚀 AXS Environment API Server`);
         console.log(`   Port: ${port}`);
         console.log(`   Base: ${OPENCLAW_BASE}`);
-        console.log(`   CLI: ${ENV_MANAGER_PYTHON} (${fs.existsSync(ENV_MANAGER_PYTHON) ? 'ok' : 'MISSING'})`);
-        if (!fs.existsSync(ENV_MANAGER_PYTHON)) {
-            console.warn('[Server]', envManagerScriptMissingMessage());
-        }
         console.log(`\nAvailable endpoints:`);
         console.log(`   GET  /api/menes/health`);
         console.log(`   GET  /api/menes/workspaces`);
