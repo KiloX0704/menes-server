@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 /**
- * AXS Environment Management HTTP API Server
+ * AXS Environment Management HTTP API Server v2.1
  *
- * 独立运行的 HTTP API 服务器，与 OpenClaw 分离部署
- * 提供完整的环境变量管理能力，支持多租户 workspace
- * 通过 openclaw CLI 自动初始化完整的 agent workspace
+ * 通过 docker exec 调用 openclaw 容器的 CLI 完成 agent 初始化
+ * 两个容器共享 volume，挂载路径相同 (/root/.openclaw)
  *
  * 用法:
  *   node axs-env-api-server.js --port 18999
  *   node axs-env-api-server.js start/stop/status
+ *
+ * 环境变量:
+ *   PORT                 服务端口 (默认 18999)
+ *   OPENCLAW_CONTAINER   openclaw 容器名 (默认 openclaw)
+ *   OPENCLAW_BASE        共享数据路径 (默认 /root/.openclaw)
+ *   SHARED_FILES_DIR     共享 SOUL.md/IDENTITY.md 目录 (默认 /root/.openclaw/skills)
  */
 
 const fs = require('fs');
@@ -17,7 +22,8 @@ const { execSync, spawn } = require('child_process');
 
 // ==================== 配置 ====================
 const DEFAULT_PORT = parseInt(process.env.PORT) || 18999;
-const OPENCLAW_BASE = process.env.OPENCLAW_BASE || '/openclaw/data';
+const OPENCLAW_CONTAINER = process.env.OPENCLAW_CONTAINER || 'openclaw';
+const OPENCLAW_BASE = process.env.OPENCLAW_BASE || '/root/.openclaw';
 const SHARED_FILES_DIR = process.env.SHARED_FILES_DIR || path.join(OPENCLAW_BASE, 'skills');
 
 // 敏感变量列表 - 默认隐藏
@@ -51,6 +57,19 @@ function workspacePathFor(tenant_name, user_id) {
  */
 function envFilePathFor(tenant_name, user_id) {
   return path.join(workspacePathFor(tenant_name, user_id), '.env.axs');
+}
+
+/**
+ * 在 openclaw 容器内执行命令
+ */
+function execInOpenClaw(cmd, options = {}) {
+  const escaped = cmd.replace(/'/g, "'\\''");
+  const fullCmd = `docker exec ${OPENCLAW_CONTAINER} /bin/sh -c '${escaped}'`;
+  console.log(`[docker] ${cmd}`);
+  return execSync(fullCmd, {
+    encoding: 'utf8',
+    timeout: options.timeout || 30000
+  });
 }
 
 /**
@@ -107,10 +126,7 @@ function upsertEnvFileExports(filePath, exportsMap) {
  */
 function isAgentRegistered(agentId) {
   try {
-    const output = execSync('openclaw agents list --json 2>/dev/null', {
-      encoding: 'utf8',
-      timeout: 15000
-    });
+    const output = execInOpenClaw('openclaw agents list --json 2>/dev/null');
     const agents = JSON.parse(output.trim());
     return agents.some(a => a.id === agentId);
   } catch (e) {
@@ -120,18 +136,17 @@ function isAgentRegistered(agentId) {
 }
 
 /**
- * 通过 openclaw CLI 创建 agent + workspace
- * CLI 会自动：
- *   - 创建 workspace 目录
- *   - 生成标准文件（AGENTS.md, TOOLS.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, SOUL.md, IDENTITY.md）
+ * 通过 docker exec 在 openclaw 容器内创建 agent
+ * CLI 自动完成：
+ *   - 创建 workspace 目录 + 标准文件 (AGENTS.md, TOOLS.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md)
  *   - 初始化 .git
  *   - 创建 .openclaw/workspace-state.json
  *   - 注册到 openclaw.json
  */
 function createAgentViaCli(agentId, wsPath) {
   try {
-    const cmd = `openclaw agents add ${JSON.stringify(agentId)} --workspace ${JSON.stringify(wsPath)} --non-interactive --json`;
-    const result = execSync(cmd, { encoding: 'utf8', timeout: 30000 });
+    const cmd = `openclaw agents add "${agentId}" --workspace "${wsPath}" --non-interactive --json`;
+    const result = execInOpenClaw(cmd, { timeout: 30000 });
     console.log(`[ensure] Created agent via CLI: ${agentId}`);
     return { success: true, output: result.trim() };
   } catch (e) {
@@ -154,27 +169,25 @@ function setupSharedSymlinks(wsPath) {
 
     // 源文件不存在则跳过
     if (!fs.existsSync(src)) {
-      console.warn(`[symlink] Shared file not found: ${src}`);
-      skipped.push(file);
+      console.warn(`[symlink] Shared source not found: ${src}`);
+      skipped.push({ file, reason: 'source_not_found' });
       continue;
     }
 
-    // 检查目标是否已是正确的 symlink
-    if (fs.existsSync(dest) || fs.lstatSync(dest).isSymbolicLink()) {
-      try {
-        const stat = fs.lstatSync(dest);
-        if (stat.isSymbolicLink()) {
-          const target = fs.readlinkSync(dest);
-          if (target === src) {
-            skipped.push(file);
-            continue; // 已正确，跳过
-          }
+    // 检查目标状态
+    try {
+      const stat = fs.lstatSync(dest);
+      if (stat.isSymbolicLink()) {
+        const target = fs.readlinkSync(dest);
+        if (target === src) {
+          skipped.push({ file, reason: 'already_correct' });
+          continue;
         }
-        // 删除旧文件（普通文件或错误的 symlink）
-        fs.unlinkSync(dest);
-      } catch (e) {
-        // dest 不存在，直接创建 symlink
       }
+      // 删除旧文件或错误的 symlink
+      fs.unlinkSync(dest);
+    } catch (e) {
+      // dest 不存在，直接创建 symlink
     }
 
     fs.symlinkSync(src, dest);
@@ -198,7 +211,6 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
   const envPath = envFilePathFor(tenant_name, user_id);
 
   let created = false;
-  let cliOutput = null;
   let cliError = null;
 
   // Step 1: 检查 agent 是否已存在
@@ -209,17 +221,16 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
     const result = createAgentViaCli(agentId, wsPath);
     if (result.success) {
       created = true;
-      cliOutput = result.output;
     } else {
       cliError = result.error;
-      // Fallback: 手动创建目录（CLI 失败时的兜底）
+      // Fallback: 手动创建目录
       if (!fs.existsSync(wsPath)) {
         fs.mkdirSync(wsPath, { recursive: true });
         console.log(`[ensure] Fallback: created workspace dir manually`);
       }
     }
   } else {
-    // 已存在但 workspace 目录不在 → 手动补建
+    // 已存在但 workspace 目录不在 → 补建
     if (!fs.existsSync(wsPath)) {
       fs.mkdirSync(wsPath, { recursive: true });
       console.log(`[ensure] Agent exists but workspace missing, created: ${wsPath}`);
@@ -245,7 +256,7 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
   };
 }
 
-// ==================== API 处理 ====================
+// ==================== API 处理函数 ====================
 
 /**
  * 获取环境变量
@@ -319,7 +330,6 @@ async function listWorkspaces() {
 
 /**
  * 删除 agent + workspace
- * 优先使用 openclaw CLI 删除以保持一致性
  */
 async function deleteAgent(tenant_name, user_id) {
   const agentId = agentIdFor(user_id);
@@ -328,14 +338,11 @@ async function deleteAgent(tenant_name, user_id) {
 
   // Step 1: 通过 CLI 删除 agent 注册
   try {
-    execSync(`openclaw agents delete ${JSON.stringify(agentId)} --force --json 2>/dev/null`, {
-      encoding: 'utf8',
-      timeout: 15000
-    });
+    execInOpenClaw(`openclaw agents delete "${agentId}" --force --json 2>/dev/null`);
     results.agent_deleted = true;
     console.log(`[delete] Removed agent via CLI: ${agentId}`);
   } catch (e) {
-    console.warn(`[delete] CLI delete failed (may not exist): ${e.message}`);
+    console.warn(`[delete] CLI delete failed: ${e.message}`);
   }
 
   // Step 2: 删除 workspace 目录
@@ -354,9 +361,6 @@ async function deleteAgent(tenant_name, user_id) {
 
 // ==================== HTTP 服务器 ====================
 
-/**
- * 读取请求体
- */
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -369,9 +373,6 @@ function readBody(req) {
   });
 }
 
-/**
- * 发送 JSON 响应
- */
 function sendJson(res, statusCode, data) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json',
@@ -380,9 +381,6 @@ function sendJson(res, statusCode, data) {
   res.end(JSON.stringify(data));
 }
 
-/**
- * CORS 预检
- */
 function handleCors(req, res) {
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
@@ -396,9 +394,6 @@ function handleCors(req, res) {
   return false;
 }
 
-/**
- * 路由处理
- */
 async function handleRequest(req, res) {
   if (handleCors(req, res)) return;
 
@@ -411,11 +406,24 @@ async function handleRequest(req, res) {
   try {
     // ========== GET /api/menes/health ==========
     if (method === 'GET' && pathname === '/api/menes/health') {
+      let clawStatus = 'unknown';
+      let clawVersion = null;
+      try {
+        const ver = execInOpenClaw('openclaw --version', { timeout: 10000 });
+        clawStatus = 'reachable';
+        clawVersion = ver.trim();
+      } catch (e) {
+        clawStatus = 'unreachable: ' + e.message;
+      }
+
       return sendJson(res, 200, {
         status: 'OK',
         timestamp: new Date().toISOString(),
-        version: '2.0.0',
+        version: '2.1.0',
         port: DEFAULT_PORT,
+        openclaw_container: OPENCLAW_CONTAINER,
+        openclaw_status: clawStatus,
+        openclaw_version: clawVersion,
         openclaw_base: OPENCLAW_BASE,
         shared_files_dir: SHARED_FILES_DIR
       });
@@ -552,10 +560,7 @@ async function handleRequest(req, res) {
     // ========== GET /api/menes/agents ==========
     if (method === 'GET' && pathname === '/api/menes/agents') {
       try {
-        const output = execSync('openclaw agents list --json 2>/dev/null', {
-          encoding: 'utf8',
-          timeout: 15000
-        });
+        const output = execInOpenClaw('openclaw agents list --json 2>/dev/null');
         const agents = JSON.parse(output.trim());
         return sendJson(res, 200, { success: true, agents });
       } catch (e) {
@@ -563,18 +568,18 @@ async function handleRequest(req, res) {
       }
     }
 
-    // 404 Not Found
+    // 404
     sendJson(res, 404, {
       success: false,
       error: `Not found: ${method} ${pathname}`,
       available_endpoints: {
-        'GET  /api/menes/health': 'Health check',
-        'GET  /api/menes/agents': 'List all registered agents (via openclaw CLI)',
-        'GET  /api/menes/workspaces': 'List all workspace directories',
-        'GET  /api/menes/env?tenant-name=<n>&user-id=<id>': 'Get environment variables',
-        'PUT  /api/menes/env': 'Update environment variables',
-        'POST /api/menes/ensure': 'Create/ensure agent + workspace (full init)',
-        'DELETE /api/menes/agent?tenant-name=<n>&user-id=<id>': 'Delete agent + workspace'
+        'GET    /api/menes/health': 'Health check (includes openclaw container status)',
+        'GET    /api/menes/agents': 'List registered agents (via openclaw CLI)',
+        'GET    /api/menes/workspaces': 'List workspace directories',
+        'GET    /api/menes/env': 'Get env vars (?tenant-name=&user-id=)',
+        'PUT    /api/menes/env': 'Update env vars (body: {tenant_name, user_id, vars})',
+        'POST   /api/menes/ensure': 'Full agent init (CLI + symlink + env)',
+        'DELETE /api/menes/agent': 'Delete agent + workspace (?tenant-name=&user-id=)'
       }
     });
 
@@ -588,40 +593,42 @@ async function handleRequest(req, res) {
 
 function showHelp() {
   console.log(`
-AXS Environment API Server v2.0
-================================
+AXS Environment API Server v2.1 (docker exec mode)
+====================================================
 
 Usage:
-  node axs-env-api-server.js              # Start on default port (18999)
+  node axs-env-api-server.js              # Start on port 18999
   node axs-env-api-server.js --port 9000  # Custom port
-  node axs-env-api-server.js start        # Start in background (daemon)
-  node axs-env-api-server.js stop         # Stop background server
-  node axs-env-api-server.js status       # Check if running
+  node axs-env-api-server.js start        # Background daemon
+  node axs-env-api-server.js stop         # Stop daemon
+  node axs-env-api-server.js status       # Check status
 
 Environment Variables:
-  PORT              Server port (default: 18999)
-  OPENCLAW_BASE     OpenClaw data directory (default: /openclaw/data)
-  SHARED_FILES_DIR  Directory with shared SOUL.md/IDENTITY.md (default: OPENCLAW_BASE/skills)
+  PORT               Server port (default: 18999)
+  OPENCLAW_CONTAINER Docker container name (default: openclaw)
+  OPENCLAW_BASE      Shared data path (default: /root/.openclaw)
+  SHARED_FILES_DIR   Shared files dir (default: /root/.openclaw/skills)
+
+Architecture:
+  menes-server container         openclaw container
+  ┌──────────────────────┐       ┌──────────────────────┐
+  │ /root/.openclaw/     │       │ /root/.openclaw/     │
+  │   workspace_admin_*  │◄═vol═►│   workspace_admin_*  │
+  │   skills/SOUL.md     │       │   agents/user_admin_*│
+  │   skills/IDENTITY.md │       │   openclaw.json      │
+  └──────────┬───────────┘       └──────────▲───────────┘
+             │                              │
+             └── docker exec openclaw ──────┘
+                 openclaw agents add ...
 
 API Endpoints:
-  GET    /api/menes/health       Health check
-  GET    /api/menes/agents       List registered agents (openclaw CLI)
-  GET    /api/menes/workspaces   List workspace directories
-  GET    /api/menes/env          Get env vars (?tenant-name=&user-id=)
-  PUT    /api/menes/env          Update env vars (body: {tenant_name, user_id, vars})
-  POST   /api/menes/ensure       Full agent init (workspace + env + symlinks)
-  DELETE /api/menes/agent        Delete agent + workspace (?tenant-name=&user-id=)
-
-POST /api/menes/ensure body:
-  Required: AXS_TENANT_NAME, AXS_USER_ID, AXS_API_TOKEN
-  Optional: AXS_BASE_URL, AXS_STATION_ID, AXS_VERSION, ... (see defaults in code)
-
-What 'ensure' does:
-  1. openclaw agents add user_admin_{AXS_USER_ID} --workspace ... --non-interactive
-     → Creates workspace with AGENTS.md, TOOLS.md, USER.md, HEARTBEAT.md, .git, etc.
-  2. Replaces SOUL.md / IDENTITY.md with symlinks to shared versions
-  3. Writes .env.axs with all AXS environment variables
-  4. Idempotent: safe to call multiple times (updates env, skips if agent exists)
+  GET    /api/menes/health       Health + openclaw status
+  GET    /api/menes/agents       List agents (openclaw CLI)
+  GET    /api/menes/workspaces   List workspace dirs
+  GET    /api/menes/env          Get env (?tenant-name=&user-id=)
+  PUT    /api/menes/env          Update env
+  POST   /api/menes/ensure       Full agent init
+  DELETE /api/menes/agent        Delete agent + workspace
 `);
 }
 
@@ -661,7 +668,6 @@ async function main() {
         try { process.kill(pid, 'SIGTERM'); console.log(`[Server] Killed PID ${pid}`); }
         catch (e) {}
       });
-      console.log('[Server] Stopped');
     }
     process.exit(0);
   }
@@ -671,7 +677,7 @@ async function main() {
       const psOutput = execSync(`pgrep -f "${path.basename(__filename)}"`).toString();
       const pids = psOutput.trim().split('\n').filter(l => parseInt(l) !== process.pid);
       if (pids.length > 0) {
-        console.log(`[Server] Running (PIDs: ${pids.join(', ')}) on port ${DEFAULT_PORT}`);
+        console.log(`[Server] Running (PIDs: ${pids.join(', ')})`);
       } else {
         console.log('[Server] Not running');
       }
@@ -687,54 +693,39 @@ async function main() {
     ? parseInt(args[portIdx + 1])
     : DEFAULT_PORT;
 
-  // 启动前检查
+  // Pre-flight checks
   console.log(`\n📋 Pre-flight checks:`);
+  console.log(`   OPENCLAW_CONTAINER: ${OPENCLAW_CONTAINER}`);
   console.log(`   OPENCLAW_BASE: ${OPENCLAW_BASE}`);
   console.log(`   SHARED_FILES_DIR: ${SHARED_FILES_DIR}`);
-
-  if (!fs.existsSync(OPENCLAW_BASE)) {
-    console.warn(`   ⚠️  OPENCLAW_BASE does not exist, will create on first ensure`);
-  }
 
   for (const file of SHARED_FILES) {
     const p = path.join(SHARED_FILES_DIR, file);
     console.log(`   ${fs.existsSync(p) ? '✅' : '⚠️ '} ${file}: ${p}`);
   }
 
-  // 检查 openclaw CLI 可用性
   try {
-    execSync('which openclaw', { encoding: 'utf8' });
-    console.log(`   ✅ openclaw CLI: available`);
+    const ver = execInOpenClaw('openclaw --version', { timeout: 10000 });
+    console.log(`   ✅ openclaw container: ${ver.trim()}`);
   } catch (e) {
-    console.error(`   ❌ openclaw CLI: NOT FOUND — agent creation will fail!`);
+    console.error(`   ❌ Cannot reach openclaw container '${OPENCLAW_CONTAINER}': ${e.message}`);
   }
 
-  // 创建 HTTP 服务器
+  // 启动 HTTP 服务器
   const server = require('http').createServer(handleRequest);
 
   server.listen(port, '0.0.0.0', () => {
-    console.log(`\n🚀 AXS Environment API Server v2.0`);
-    console.log(`   Port: ${port}`);
-    console.log(`   PID: ${process.pid}`);
-    console.log(`\n   Endpoints:`);
-    console.log(`   GET    /api/menes/health`);
-    console.log(`   GET    /api/menes/agents`);
-    console.log(`   GET    /api/menes/workspaces`);
-    console.log(`   GET    /api/menes/env?tenant-name=<n>&user-id=<id>`);
-    console.log(`   PUT    /api/menes/env`);
-    console.log(`   POST   /api/menes/ensure`);
-    console.log(`   DELETE /api/menes/agent?tenant-name=<n>&user-id=<id>`);
-    console.log('');
+    console.log(`\n🚀 AXS Environment API Server v2.1`);
+    console.log(`   Port: ${port} | PID: ${process.pid}`);
+    console.log(`   Container: ${OPENCLAW_CONTAINER}\n`);
   });
 
-  // Graceful shutdown
   process.on('SIGTERM', () => {
-    console.log('\n[Server] SIGTERM received, shutting down...');
+    console.log('\n[Server] Shutting down...');
     server.close(() => process.exit(0));
   });
-
   process.on('SIGINT', () => {
-    console.log('\n[Server] SIGINT received, shutting down...');
+    console.log('\n[Server] Shutting down...');
     server.close(() => process.exit(0));
   });
 }
