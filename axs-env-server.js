@@ -1,19 +1,13 @@
 #!/usr/bin/env node
 /**
- * AXS Environment Management HTTP API Server v2.1
+ * AXS Environment Management HTTP API Server v2.2
  *
  * 通过 docker exec 调用 openclaw 容器的 CLI 完成 agent 初始化
- * 两个容器共享 volume，挂载路径相同 (/root/.openclaw)
+ * 优化：直接读写本地 openclaw.json 减少 docker exec 调用
  *
  * 用法:
  *   node axs-env-api-server.js --port 18999
  *   node axs-env-api-server.js start/stop/status
- *
- * 环境变量:
- *   PORT                 服务端口 (默认 18999)
- *   OPENCLAW_CONTAINER   openclaw 容器名 (默认 openclaw)
- *   OPENCLAW_BASE        共享数据路径 (默认 /root/.openclaw)
- *   SHARED_FILES_DIR     共享 SOUL.md/IDENTITY.md 目录 (默认 /root/.openclaw/skills)
  */
 
 const fs = require('fs');
@@ -25,36 +19,32 @@ const DEFAULT_PORT = parseInt(process.env.PORT) || 18999;
 const OPENCLAW_CONTAINER = process.env.OPENCLAW_CONTAINER || 'openclaw';
 const OPENCLAW_BASE = process.env.OPENCLAW_BASE || '/root/.openclaw';
 const SHARED_FILES_DIR = process.env.SHARED_FILES_DIR || path.join(OPENCLAW_BASE, 'skills');
+const OPENCLAW_CONFIG_PATH = path.join(OPENCLAW_BASE, 'openclaw.json');
 
-// 敏感变量列表 - 默认隐藏
+// 敏感变量列表
 const SENSITIVE_VARS = [
   'AXS_API_TOKEN',
   'APIFOX_API_TOKEN',
   'AXS_USER_UUID'
 ];
 
-// 共享文件列表 - 用 symlink 链接到每个 workspace
+// 共享文件列表
 const SHARED_FILES = ['SOUL.md', 'IDENTITY.md'];
 
 // ==================== 工具函数 ====================
 
-/**
- * Agent ID 命名规则（对齐目录名）
- */
 function agentIdFor(user_id) {
   return `user_admin_${user_id}`;
 }
 
-/**
- * Workspace 路径
- */
+function agentNameFor(tenant_name, user_id) {
+  return `${tenant_name}_${user_id}`;
+}
+
 function workspacePathFor(tenant_name, user_id) {
   return path.join(OPENCLAW_BASE, `workspace_${tenant_name}_${user_id}`);
 }
 
-/**
- * .env.axs 文件路径
- */
 function envFilePathFor(tenant_name, user_id) {
   return path.join(workspacePathFor(tenant_name, user_id), '.env.axs');
 }
@@ -72,9 +62,6 @@ function execInOpenClaw(cmd, options = {}) {
   });
 }
 
-/**
- * 转义 env 值中的特殊字符
- */
 function escapeEnvValue(value) {
   return String(value ?? '')
     .replaceAll('\\', '\\\\')
@@ -83,9 +70,6 @@ function escapeEnvValue(value) {
     .replaceAll('\n', '\\n');
 }
 
-/**
- * 写入/更新 .env.axs 文件（export KEY="VALUE" 格式）
- */
 function upsertEnvFileExports(filePath, exportsMap) {
   const normalized = {};
   for (const [k, v] of Object.entries(exportsMap || {})) {
@@ -119,29 +103,133 @@ function upsertEnvFileExports(filePath, exportsMap) {
   fs.writeFileSync(filePath, lines.join('\n').trimEnd() + '\n', 'utf8');
 }
 
-// ==================== 核心逻辑 ====================
+// ==================== openclaw.json 操作（本地直接读写，无需 docker exec）====================
 
 /**
- * 检查 agent 是否已在 openclaw 中注册
+ * 读取 openclaw.json
+ */
+function readOpenClawConfig() {
+  if (!fs.existsSync(OPENCLAW_CONFIG_PATH)) {
+    return null;
+  }
+  return JSON.parse(fs.readFileSync(OPENCLAW_CONFIG_PATH, 'utf8'));
+}
+
+/**
+ * 写入 openclaw.json
+ */
+function writeOpenClawConfig(config) {
+  fs.writeFileSync(OPENCLAW_CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+}
+
+/**
+ * 检查 agent 是否已注册（直接读本地文件，毫秒级）
  */
 function isAgentRegistered(agentId) {
   try {
-    const output = execInOpenClaw('openclaw agents list --json 2>/dev/null');
-    const agents = JSON.parse(output.trim());
-    return agents.some(a => a.id === agentId);
+    const config = readOpenClawConfig();
+    if (!config || !config.agents || !config.agents.list) return false;
+    return config.agents.list.some(a => a.id === agentId);
   } catch (e) {
-    console.warn(`[ensure] Failed to list agents: ${e.message}`);
+    console.warn(`[check] Failed to read config: ${e.message}`);
     return false;
   }
 }
 
 /**
+ * 修补 agent 配置：添加 reasoningDefault、修正 name
+ */
+function patchAgentConfig(agentId, tenant_name, user_id) {
+  try {
+    const config = readOpenClawConfig();
+    if (!config || !config.agents || !config.agents.list) return false;
+
+    const agent = config.agents.list.find(a => a.id === agentId);
+    if (!agent) return false;
+
+    let changed = false;
+
+    // 修正 name: 应为 {tenant_name}_{user_id}
+    const correctName = agentNameFor(tenant_name, user_id);
+    if (agent.name !== correctName) {
+      agent.name = correctName;
+      changed = true;
+    }
+
+    // 添加 reasoningDefault
+    if (agent.reasoningDefault !== 'stream') {
+      agent.reasoningDefault = 'stream';
+      changed = true;
+    }
+
+    if (changed) {
+      writeOpenClawConfig(config);
+      console.log(`[patch] Updated agent config: name=${correctName}, reasoningDefault=stream`);
+    }
+
+    return changed;
+  } catch (e) {
+    console.error(`[patch] Failed to patch agent config: ${e.message}`);
+    return false;
+  }
+}
+
+/**
+ * 确保 binding 存在
+ * binding 格式:
+ * {
+ *   "agentId": "user_admin_xxx",
+ *   "match": { "channel": "webchat", "peer": { "kind": "direct", "id": "admin_xxx" } }
+ * }
+ */
+function ensureBinding(agentId, tenant_name, user_id) {
+  try {
+    const config = readOpenClawConfig();
+    if (!config) return false;
+
+    if (!config.bindings) config.bindings = [];
+
+    const peerId = agentNameFor(tenant_name, user_id);
+
+    // 检查是否已存在
+    const exists = config.bindings.some(b =>
+      b.agentId === agentId &&
+      b.match &&
+      b.match.channel === 'webchat' &&
+      b.match.peer &&
+      b.match.peer.id === peerId
+    );
+
+    if (exists) {
+      console.log(`[binding] Already exists for ${agentId}`);
+      return false;
+    }
+
+    // 添加 binding
+    config.bindings.push({
+      agentId: agentId,
+      match: {
+        channel: 'webchat',
+        peer: {
+          kind: 'direct',
+          id: peerId
+        }
+      }
+    });
+
+    writeOpenClawConfig(config);
+    console.log(`[binding] Added webchat binding: ${agentId} ← peer:${peerId}`);
+    return true;
+  } catch (e) {
+    console.error(`[binding] Failed to ensure binding: ${e.message}`);
+    return false;
+  }
+}
+
+// ==================== 核心逻辑 ====================
+
+/**
  * 通过 docker exec 在 openclaw 容器内创建 agent
- * CLI 自动完成：
- *   - 创建 workspace 目录 + 标准文件 (AGENTS.md, TOOLS.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md)
- *   - 初始化 .git
- *   - 创建 .openclaw/workspace-state.json
- *   - 注册到 openclaw.json
  */
 function createAgentViaCli(agentId, wsPath) {
   try {
@@ -156,8 +244,7 @@ function createAgentViaCli(agentId, wsPath) {
 }
 
 /**
- * 将共享文件替换为 symlink
- * 删除 CLI 生成的默认文件，指向 SHARED_FILES_DIR 下的共享版本
+ * 设置共享文件 symlink
  */
 function setupSharedSymlinks(wsPath) {
   const linked = [];
@@ -167,14 +254,12 @@ function setupSharedSymlinks(wsPath) {
     const src = path.join(SHARED_FILES_DIR, file);
     const dest = path.join(wsPath, file);
 
-    // 源文件不存在则跳过
     if (!fs.existsSync(src)) {
       console.warn(`[symlink] Shared source not found: ${src}`);
       skipped.push({ file, reason: 'source_not_found' });
       continue;
     }
 
-    // 检查目标状态
     try {
       const stat = fs.lstatSync(dest);
       if (stat.isSymbolicLink()) {
@@ -184,10 +269,9 @@ function setupSharedSymlinks(wsPath) {
           continue;
         }
       }
-      // 删除旧文件或错误的 symlink
       fs.unlinkSync(dest);
     } catch (e) {
-      // dest 不存在，直接创建 symlink
+      // dest 不存在
     }
 
     fs.symlinkSync(src, dest);
@@ -199,11 +283,9 @@ function setupSharedSymlinks(wsPath) {
 }
 
 /**
- * 完整的 agent 初始化流程
- * 1. 检查是否已存在
- * 2. CLI 创建 agent + workspace
- * 3. 替换共享文件为 symlink
- * 4. 写入 .env.axs
+ * 完整的 agent 初始化流程（优化版）
+ * - 已存在：跳过 docker exec，只更新 env（毫秒级）
+ * - 新建：CLI 创建 + 本地 patch config + binding
  */
 function ensureAgentFull(tenant_name, user_id, envVars) {
   const agentId = agentIdFor(user_id);
@@ -212,8 +294,10 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
 
   let created = false;
   let cliError = null;
+  let configPatched = false;
+  let bindingAdded = false;
 
-  // Step 1: 检查 agent 是否已存在
+  // Step 1: 检查 agent 是否已存在（本地文件读取，毫秒级）
   const alreadyExists = isAgentRegistered(agentId);
 
   // Step 2: 不存在则通过 CLI 创建
@@ -223,34 +307,41 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
       created = true;
     } else {
       cliError = result.error;
-      // Fallback: 手动创建目录
       if (!fs.existsSync(wsPath)) {
         fs.mkdirSync(wsPath, { recursive: true });
         console.log(`[ensure] Fallback: created workspace dir manually`);
       }
     }
   } else {
-    // 已存在但 workspace 目录不在 → 补建
     if (!fs.existsSync(wsPath)) {
       fs.mkdirSync(wsPath, { recursive: true });
       console.log(`[ensure] Agent exists but workspace missing, created: ${wsPath}`);
     }
   }
 
-  // Step 3: 设置共享文件 symlink
+  // Step 3: 修补 agent 配置（reasoningDefault + name）
+  configPatched = patchAgentConfig(agentId, tenant_name, user_id);
+
+  // Step 4: 确保 binding 存在
+  bindingAdded = ensureBinding(agentId, tenant_name, user_id);
+
+  // Step 5: 设置共享文件 symlink
   const symlinks = setupSharedSymlinks(wsPath);
 
-  // Step 4: 写入 .env.axs
+  // Step 6: 写入 .env.axs
   upsertEnvFileExports(envPath, envVars);
   console.log(`[ensure] Wrote env file: ${envPath}`);
 
   return {
     success: true,
     agent_id: agentId,
+    agent_name: agentNameFor(tenant_name, user_id),
     workspace_path: wsPath,
     env_path: envPath,
     created,
     already_existed: alreadyExists,
+    config_patched: configPatched,
+    binding_added: bindingAdded,
     symlinks,
     cli_error: cliError || undefined
   };
@@ -258,9 +349,6 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
 
 // ==================== API 处理函数 ====================
 
-/**
- * 获取环境变量
- */
 async function getEnvVars(tenant_name, user_id, show_sensitive = false) {
   try {
     const envFilePath = envFilePathFor(tenant_name, user_id);
@@ -303,9 +391,6 @@ async function getEnvVars(tenant_name, user_id, show_sensitive = false) {
   }
 }
 
-/**
- * 列出所有 workspace
- */
 async function listWorkspaces() {
   try {
     const entries = fs.readdirSync(OPENCLAW_BASE, { withFileTypes: true });
@@ -328,21 +413,36 @@ async function listWorkspaces() {
   }
 }
 
-/**
- * 删除 agent + workspace
- */
 async function deleteAgent(tenant_name, user_id) {
   const agentId = agentIdFor(user_id);
   const wsPath = workspacePathFor(tenant_name, user_id);
-  const results = { agent_deleted: false, workspace_deleted: false };
+  const results = { agent_deleted: false, workspace_deleted: false, binding_removed: false };
 
-  // Step 1: 通过 CLI 删除 agent 注册
+  // Step 1: 从 openclaw.json 删除 agent 和 binding
   try {
-    execInOpenClaw(`openclaw agents delete "${agentId}" --force --json 2>/dev/null`);
-    results.agent_deleted = true;
-    console.log(`[delete] Removed agent via CLI: ${agentId}`);
+    const config = readOpenClawConfig();
+    if (config) {
+      // 删除 agent
+      if (config.agents && config.agents.list) {
+        const before = config.agents.list.length;
+        config.agents.list = config.agents.list.filter(a => a.id !== agentId);
+        results.agent_deleted = config.agents.list.length < before;
+      }
+
+      // 删除 binding
+      if (config.bindings) {
+        const before = config.bindings.length;
+        config.bindings = config.bindings.filter(b => b.agentId !== agentId);
+        results.binding_removed = config.bindings.length < before;
+      }
+
+      if (results.agent_deleted || results.binding_removed) {
+        writeOpenClawConfig(config);
+        console.log(`[delete] Removed from openclaw.json: agent=${results.agent_deleted}, binding=${results.binding_removed}`);
+      }
+    }
   } catch (e) {
-    console.warn(`[delete] CLI delete failed: ${e.message}`);
+    console.warn(`[delete] Config update failed: ${e.message}`);
   }
 
   // Step 2: 删除 workspace 目录
@@ -350,6 +450,13 @@ async function deleteAgent(tenant_name, user_id) {
     fs.rmSync(wsPath, { recursive: true, force: true });
     results.workspace_deleted = true;
     console.log(`[delete] Removed workspace: ${wsPath}`);
+  }
+
+  // Step 3: 删除 agent state 目录
+  const agentStateDir = path.join(OPENCLAW_BASE, 'agents', agentId);
+  if (fs.existsSync(agentStateDir)) {
+    fs.rmSync(agentStateDir, { recursive: true, force: true });
+    console.log(`[delete] Removed agent state: ${agentStateDir}`);
   }
 
   if (!results.agent_deleted && !results.workspace_deleted) {
@@ -419,7 +526,7 @@ async function handleRequest(req, res) {
       return sendJson(res, 200, {
         status: 'OK',
         timestamp: new Date().toISOString(),
-        version: '2.1.0',
+        version: '2.2.0',
         port: DEFAULT_PORT,
         openclaw_container: OPENCLAW_CONTAINER,
         openclaw_status: clawStatus,
@@ -433,7 +540,6 @@ async function handleRequest(req, res) {
     if (method === 'POST' && pathname === '/api/menes/ensure') {
       const body = await readBody(req);
 
-      // 必填校验
       const required = ['AXS_TENANT_NAME', 'AXS_USER_ID', 'AXS_API_TOKEN'];
       for (const field of required) {
         if (!body[field]) {
@@ -444,7 +550,6 @@ async function handleRequest(req, res) {
         }
       }
 
-      // 默认值
       const defaults = {
         AXS_STATION_ID: '800019',
         AXS_BASE_URL: 'https://admin.pre.linkedsight.com',
@@ -467,7 +572,6 @@ async function handleRequest(req, res) {
 
       const { AXS_TENANT_NAME, AXS_USER_ID } = body;
 
-      // 一步到位：CLI 创建 + symlink + env
       const result = ensureAgentFull(AXS_TENANT_NAME, AXS_USER_ID, {
         AXS_API_TOKEN: body.AXS_API_TOKEN,
         AXS_BASE_URL: body.AXS_BASE_URL,
@@ -560,8 +664,8 @@ async function handleRequest(req, res) {
     // ========== GET /api/menes/agents ==========
     if (method === 'GET' && pathname === '/api/menes/agents') {
       try {
-        const output = execInOpenClaw('openclaw agents list --json 2>/dev/null');
-        const agents = JSON.parse(output.trim());
+        const config = readOpenClawConfig();
+        const agents = (config && config.agents && config.agents.list) || [];
         return sendJson(res, 200, { success: true, agents });
       } catch (e) {
         return sendJson(res, 500, { success: false, error: e.message });
@@ -573,12 +677,12 @@ async function handleRequest(req, res) {
       success: false,
       error: `Not found: ${method} ${pathname}`,
       available_endpoints: {
-        'GET    /api/menes/health': 'Health check (includes openclaw container status)',
-        'GET    /api/menes/agents': 'List registered agents (via openclaw CLI)',
+        'GET    /api/menes/health': 'Health check',
+        'GET    /api/menes/agents': 'List registered agents',
         'GET    /api/menes/workspaces': 'List workspace directories',
         'GET    /api/menes/env': 'Get env vars (?tenant-name=&user-id=)',
-        'PUT    /api/menes/env': 'Update env vars (body: {tenant_name, user_id, vars})',
-        'POST   /api/menes/ensure': 'Full agent init (CLI + symlink + env)',
+        'PUT    /api/menes/env': 'Update env vars',
+        'POST   /api/menes/ensure': 'Full agent init',
         'DELETE /api/menes/agent': 'Delete agent + workspace (?tenant-name=&user-id=)'
       }
     });
@@ -589,12 +693,17 @@ async function handleRequest(req, res) {
   }
 }
 
-// ==================== 启动 / 进程管理 ====================
+// ==================== 启动 ====================
 
 function showHelp() {
   console.log(`
-AXS Environment API Server v2.1 (docker exec mode)
-====================================================
+AXS Environment API Server v2.2 (optimized)
+=============================================
+
+Performance:
+  - Agent existence check: reads local openclaw.json (~1ms)
+  - Existing user ensure: no docker exec needed (~5ms total)
+  - New user ensure: one docker exec for CLI creation (~3-5s)
 
 Usage:
   node axs-env-api-server.js              # Start on port 18999
@@ -608,27 +717,6 @@ Environment Variables:
   OPENCLAW_CONTAINER Docker container name (default: openclaw)
   OPENCLAW_BASE      Shared data path (default: /root/.openclaw)
   SHARED_FILES_DIR   Shared files dir (default: /root/.openclaw/skills)
-
-Architecture:
-  menes-server container         openclaw container
-  ┌──────────────────────┐       ┌──────────────────────┐
-  │ /root/.openclaw/     │       │ /root/.openclaw/     │
-  │   workspace_admin_*  │◄═vol═►│   workspace_admin_*  │
-  │   skills/SOUL.md     │       │   agents/user_admin_*│
-  │   skills/IDENTITY.md │       │   openclaw.json      │
-  └──────────┬───────────┘       └──────────▲───────────┘
-             │                              │
-             └── docker exec openclaw ──────┘
-                 openclaw agents add ...
-
-API Endpoints:
-  GET    /api/menes/health       Health + openclaw status
-  GET    /api/menes/agents       List agents (openclaw CLI)
-  GET    /api/menes/workspaces   List workspace dirs
-  GET    /api/menes/env          Get env (?tenant-name=&user-id=)
-  PUT    /api/menes/env          Update env
-  POST   /api/menes/ensure       Full agent init
-  DELETE /api/menes/agent        Delete agent + workspace
 `);
 }
 
@@ -687,17 +775,17 @@ async function main() {
     process.exit(0);
   }
 
-  // 解析 --port
   const portIdx = args.findIndex(a => a === '--port' || a === '-p');
   const port = portIdx >= 0 && args[portIdx + 1]
     ? parseInt(args[portIdx + 1])
     : DEFAULT_PORT;
 
-  // Pre-flight checks
+  // Pre-flight
   console.log(`\n📋 Pre-flight checks:`);
   console.log(`   OPENCLAW_CONTAINER: ${OPENCLAW_CONTAINER}`);
   console.log(`   OPENCLAW_BASE: ${OPENCLAW_BASE}`);
   console.log(`   SHARED_FILES_DIR: ${SHARED_FILES_DIR}`);
+  console.log(`   CONFIG: ${OPENCLAW_CONFIG_PATH} (${fs.existsSync(OPENCLAW_CONFIG_PATH) ? '✅ exists' : '❌ missing'})`);
 
   for (const file of SHARED_FILES) {
     const p = path.join(SHARED_FILES_DIR, file);
@@ -708,14 +796,13 @@ async function main() {
     const ver = execInOpenClaw('openclaw --version', { timeout: 10000 });
     console.log(`   ✅ openclaw container: ${ver.trim()}`);
   } catch (e) {
-    console.error(`   ❌ Cannot reach openclaw container '${OPENCLAW_CONTAINER}': ${e.message}`);
+    console.error(`   ❌ Cannot reach openclaw container: ${e.message}`);
   }
 
-  // 启动 HTTP 服务器
   const server = require('http').createServer(handleRequest);
 
   server.listen(port, '0.0.0.0', () => {
-    console.log(`\n🚀 AXS Environment API Server v2.1`);
+    console.log(`\n🚀 AXS Environment API Server v2.2`);
     console.log(`   Port: ${port} | PID: ${process.pid}`);
     console.log(`   Container: ${OPENCLAW_CONTAINER}\n`);
   });
