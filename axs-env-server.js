@@ -297,7 +297,7 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
   let configPatched = false;
   let bindingAdded = false;
 
-  // Step 1: 检查 agent 是否已存在（本地文件读取，毫秒级）
+  // Step 1: 检查 agent 是否已存在
   const alreadyExists = isAgentRegistered(agentId);
 
   // Step 2: 不存在则通过 CLI 创建
@@ -305,12 +305,26 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
     const result = createAgentViaCli(agentId, wsPath);
     if (result.success) {
       created = true;
-    } else {
-      cliError = result.error;
-      if (!fs.existsSync(wsPath)) {
-        fs.mkdirSync(wsPath, { recursive: true });
-        console.log(`[ensure] Fallback: created workspace dir manually`);
+      // ⚡ 验证：CLI 说成功了，但 config 里真的有吗？
+      if (!isAgentRegistered(agentId)) {
+        return {
+          success: false,
+          error: `Agent CLI reported success but agent "${agentId}" not found in openclaw.json. Check openclaw container logs.`,
+          agent_id: agentId,
+          workspace_path: wsPath,
+          cli_output: result.output
+        };
       }
+    } else {
+      // ⚡ CLI 失败 → 直接返回错误，不添加 binding
+      return {
+        success: false,
+        error: `Agent creation failed via CLI. The agent "${agentId}" could not be registered.`,
+        detail: result.error,
+        agent_id: agentId,
+        workspace_path: wsPath,
+        hint: 'Check: 1) openclaw container is running, 2) openclaw agents add works manually, 3) disk space'
+      };
     }
   } else {
     if (!fs.existsSync(wsPath)) {
@@ -319,18 +333,11 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
     }
   }
 
-  // Step 3: 修补 agent 配置（reasoningDefault + name）
+  // Step 3-6: 只有 agent 确实存在时才继续
   configPatched = patchAgentConfig(agentId, tenant_name, user_id);
-
-  // Step 4: 确保 binding 存在
   bindingAdded = ensureBinding(agentId, tenant_name, user_id);
-
-  // Step 5: 设置共享文件 symlink
   const symlinks = setupSharedSymlinks(wsPath);
-
-  // Step 6: 写入 .env.axs
   upsertEnvFileExports(envPath, envVars);
-  console.log(`[ensure] Wrote env file: ${envPath}`);
 
   return {
     success: true,
@@ -342,8 +349,7 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
     already_existed: alreadyExists,
     config_patched: configPatched,
     binding_added: bindingAdded,
-    symlinks,
-    cli_error: cliError || undefined
+    symlinks
   };
 }
 
@@ -594,6 +600,10 @@ async function handleRequest(req, res) {
         AXS_CACHE_TTL: body.AXS_CACHE_TTL,
         AXS_DEBUG: body.AXS_DEBUG
       });
+
+      if (!result.success) {
+        return sendJson(res, 503, result);  // 503 Service Unavailable - 让前端知道创建失败
+        }
 
       return sendJson(res, 200, result);
     }
