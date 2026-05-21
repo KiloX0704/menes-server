@@ -244,18 +244,21 @@ function createAgentViaCli(agentId, wsPath) {
 }
 
 /**
- * 设置共享文件 symlink
+ * 设置共享文件（复制方式，不再用 symlink）
+ * CLI 生成的默认文件 → 改名为 .bak
+ * 共享目录的文件 → 复制到 workspace
  */
-function setupSharedSymlinks(wsPath) {
-  const linked = [];
+function setupSharedFiles(wsPath) {
+  const copied = [];
   const skipped = [];
 
   for (const file of SHARED_FILES) {
     const src = path.join(SHARED_FILES_DIR, file);
     const dest = path.join(wsPath, file);
+    const bakDest = dest + '.bak';
 
     if (!fs.existsSync(src)) {
-      console.warn(`[symlink] Shared source not found: ${src}`);
+      console.warn(`[shared] Shared source not found: ${src}`);
       skipped.push({ file, reason: 'source_not_found' });
       continue;
     }
@@ -263,23 +266,28 @@ function setupSharedSymlinks(wsPath) {
     try {
       const stat = fs.lstatSync(dest);
       if (stat.isSymbolicLink()) {
-        const target = fs.readlinkSync(dest);
-        if (target === src) {
-          skipped.push({ file, reason: 'already_correct' });
-          continue;
+        // 已经是 symlink，删掉重新复制
+        fs.unlinkSync(dest);
+      } else if (stat.isFile()) {
+        // CLI 生成的默认文件 → 改名为 .bak（不覆盖已有的 .bak）
+        if (!fs.existsSync(bakDest)) {
+          fs.renameSync(dest, bakDest);
+          console.log(`[shared] Renamed ${file} → ${file}.bak`);
+        } else {
+          fs.unlinkSync(dest);
         }
       }
-      fs.unlinkSync(dest);
     } catch (e) {
-      // dest 不存在
+      // dest 不存在，正常继续
     }
 
-    fs.symlinkSync(src, dest);
-    linked.push(file);
-    console.log(`[symlink] ${file} → ${src}`);
+    // 复制共享文件到 workspace
+    fs.copyFileSync(src, dest);
+    copied.push(file);
+    console.log(`[shared] Copied ${file} from ${src}`);
   }
 
-  return { linked, skipped };
+  return { copied, skipped };
 }
 
 /**
@@ -336,7 +344,7 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
   // Step 3-6: 只有 agent 确实存在时才继续
   configPatched = patchAgentConfig(agentId, tenant_name, user_id);
   bindingAdded = ensureBinding(agentId, tenant_name, user_id);
-  const symlinks = setupSharedSymlinks(wsPath);
+  const shared_files = setupSharedFiles(wsPath);
   upsertEnvFileExports(envPath, envVars);
 
   return {
@@ -349,7 +357,7 @@ function ensureAgentFull(tenant_name, user_id, envVars) {
     already_existed: alreadyExists,
     config_patched: configPatched,
     binding_added: bindingAdded,
-    symlinks
+    shared_files
   };
 }
 
